@@ -1,0 +1,4 @@
+module CTranscribe [system] {
+    header "../vendor/transcribe.cpp/include/transcribe.h"
+    export *
+}
