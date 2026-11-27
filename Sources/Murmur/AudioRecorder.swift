@@ -5,6 +5,8 @@ enum RecorderError: Error { case noInput }
 /// Captures the default microphone as 16 kHz mono float PCM.
 final class AudioRecorder: @unchecked Sendable {
     let meter = LevelMeter()
+    /// Each converted chunk, on the audio thread. The buffer is only valid for the call.
+    var onSamples: ((UnsafeBufferPointer<Float>) -> Void)?
 
     private var engine: AVAudioEngine?
     private var converter: AVAudioConverter?
@@ -76,6 +78,7 @@ final class AudioRecorder: @unchecked Sendable {
         for s in chunk { sum += s * s }
         let rms = (sum / Float(count)).squareRoot()
         meter.target = LevelMeter.level(forRMS: rms)
+        onSamples?(chunk)
 
         lock.lock()
         samples.append(contentsOf: chunk)

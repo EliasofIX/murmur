@@ -1,2 +1,25 @@
 .DS_Store
 build/
+DerivedData/
+.swiftpm/
+*.xcuserstate
+xcuserdata/
+
+# Models and recordings live under Application Support. They are large,
+# and recordings are private speech.
+*.gguf
+*.wav
+*.m4a
+*.mp3
+*.aiff
+*.caf
+
+# Secrets and signing material
+.env
+.env.*
+*.pem
+*.p12
+*.key
+*.cer
+*.mobileprovision
+credentials.json

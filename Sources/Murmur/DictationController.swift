@@ -82,15 +82,48 @@ final class DictationController {
 
     // MARK: - Recording
 
+    var canRetryLast: Bool {
+        if case .idle = state {} else { return false }
+        return TakeStore.shared.hasLast
+    }
+
+    /// Runs the saved recording again and inserts whatever text comes back.
+    func retryLast() {
+        guard canRetryLast else { return }
+        guard settings.modelReady else {
+            panel.present(.message(settings.modelError == nil ? "Warming up…" : "Model unavailable"))
+            panel.dismiss(after: 1.4)
+            return
+        }
+        guard let pcm = TakeStore.shared.loadLast(), pcm.count > 16_000 / 4 else {
+            panel.present(.message("No recording to retry"))
+            panel.dismiss(after: 1.4)
+            return
+        }
+        state = .processing
+        panel.present(.processing)
+        transcribe(pcm)
+    }
+
+    func showSavedTakeNotice() {
+        guard TakeStore.shared.isPending else { return }
+        panel.present(.message("Saved — retry from the menu"))
+        panel.dismiss(after: 2.6)
+    }
+
     private func beginRecording() -> Bool {
+        TakeStore.shared.begin()
+        recorder.onSamples = { TakeStore.shared.append($0) }
         do {
             try recorder.start()
         } catch {
             panel.present(.message(settings.microphone ? "No microphone available" : "Microphone access needed"))
             panel.dismiss(after: 2)
             if !settings.microphone { settings.requestMicrophone() }
+            TakeStore.shared.discard()
             return false
         }
+        panel.model.recordingStarted = Date()
         scheduleAutoStop()
         return true
     }
@@ -110,6 +143,9 @@ final class DictationController {
 
     private func scheduleAutoStop() {
         autoStop?.cancel()
+        autoStop = nil
+        // Parakeet reports no audio ceiling (0). Only stop early when a model actually has one.
+        guard transcriber.maxAudioSeconds > 0 else { return }
         let limit = max(5, transcriber.maxAudioSeconds - 1)
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -125,8 +161,18 @@ final class DictationController {
     private func cancelRecording(silently: Bool) {
         pillWork?.cancel(); autoStop?.cancel()
         _ = recorder.stop()
+        TakeStore.shared.discard()
         state = .idle
-        if panel.model.visible { panel.dismiss() }
+        if panel.model.visible {
+            panel.dismiss()
+            // Keep the readout through the fade, then drop it once the pill is gone.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, case .idle = self.state else { return }
+                self.panel.model.recordingStarted = nil
+            }
+        } else {
+            panel.model.recordingStarted = nil
+        }
         if !silently { feedback(start: false) }
     }
 
@@ -139,6 +185,8 @@ final class DictationController {
 
         guard pcm.count > 16_000 / 4, voiced > 0.12 else {
             // Nothing but silence/noise: don't feed it to the model (avoids hallucinated text).
+            TakeStore.shared.discard()
+            panel.model.recordingStarted = nil
             if panel.model.visible {
                 panel.update(.message("Didn’t catch that"))
                 panel.dismiss(after: 1.0)
@@ -147,8 +195,15 @@ final class DictationController {
             return
         }
 
+        // On disk before the model runs, so a crash or an out-of-memory kill keeps the take.
+        TakeStore.shared.commit()
+        panel.model.recordingStarted = nil
         panel.present(.processing)
-        transcriber.transcribe(pcm, language: settings.languageCode) { [weak self] result in
+        transcribe(pcm)
+    }
+
+    private func transcribe(_ pcm: [Float]) {
+        transcriber.transcribe(pcm, language: nil) { [weak self] result in
             DispatchQueue.main.async { self?.complete(result) }
         }
     }
@@ -157,21 +212,34 @@ final class DictationController {
         defer { state = .idle }
         switch result {
         case .success(let text) where !text.isEmpty:
-            let pasted = TextInserter.insert(text)
-            if pasted {
-                panel.update(.done)
-                panel.dismiss(after: 0.45)
-            } else {
-                panel.update(.message("Copied — allow Accessibility to auto‑paste"))
-                panel.dismiss(after: 2.4)
-            }
+            deliver(text)
         case .success:
             panel.update(.message("Didn’t catch that"))
             panel.dismiss(after: 1.0)
         case .failure(let error):
             NSLog("Transcription error: \(error)")
-            panel.update(.message("Transcription failed"))
-            panel.dismiss(after: 2)
+            if let saved = TakeStore.shared.savedTranscript() {
+                deliver(saved)
+            } else if TakeStore.shared.hasLast {
+                panel.update(.message("Saved — retry from the menu"))
+                panel.dismiss(after: 2.4)
+            } else {
+                panel.update(.message("Transcription failed"))
+                panel.dismiss(after: 2)
+            }
+        }
+    }
+
+    /// Writes the text to disk and the clipboard, then pastes it if Accessibility allows.
+    private func deliver(_ text: String) {
+        TakeStore.shared.markDelivered(text: text)
+        let pasted = TextInserter.insert(text)
+        if pasted {
+            panel.update(.done)
+            panel.dismiss(after: 0.45)
+        } else {
+            panel.update(.message("Copied — allow Accessibility to auto‑paste"))
+            panel.dismiss(after: 2.4)
         }
     }
 

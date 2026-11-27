@@ -8,12 +8,6 @@ import SwiftUI
 final class AppSettings {
     static let shared = AppSettings()
 
-    static let languages: [(code: String?, name: String)] = [
-        (nil, "Automatic"), ("en", "English"), ("de", "Deutsch"), ("fr", "Français"),
-        ("es", "Español"), ("pt", "Português"), ("ja", "日本語"),
-    ]
-
-    var language: String { didSet { UserDefaults.standard.set(language, forKey: "language") } }
     var sounds: Bool { didSet { UserDefaults.standard.set(sounds, forKey: "sounds") } }
 
     var microphone = false
@@ -26,13 +20,9 @@ final class AppSettings {
     var allPermissionsGranted: Bool { microphone && accessibility && inputMonitoring }
 
     private init() {
-        let d = UserDefaults.standard
-        language = d.string(forKey: "language") ?? "auto"
-        sounds = d.object(forKey: "sounds") as? Bool ?? true
+        sounds = UserDefaults.standard.object(forKey: "sounds") as? Bool ?? true
         refresh()
     }
-
-    var languageCode: String? { language == "auto" ? nil : language }
 
     func refresh() {
         microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
@@ -72,79 +62,69 @@ final class AppSettings {
 
 struct SettingsView: View {
     @Bindable var settings = AppSettings.shared
+    @Bindable var files = FileTranscriptModel.shared
 
     var body: some View {
-        Form {
-            Section {
-                VStack(spacing: 6) {
-                    Image(systemName: "waveform.circle.fill")
-                        .font(.system(size: 44))
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, LinearGradient(colors: [.cyan, .blue, .purple, .pink], startPoint: .leading, endPoint: .trailing))
-                    Text("Murmur").font(.title2.bold())
-                    Text("Hold **Left ⌥ Option** and speak. Release to insert the text.\nOr double‑tap it to keep listening, then tap once to finish.")
-                        .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                }
+        GlassPage {
+            PillMark(title: "Murmur")
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-            }
+            Text("Hold **Left ⌥ Option** and speak. Release to insert the text.\nOr double-tap it to keep listening, then tap once to finish.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
 
-            Section("Permissions") {
-                PermissionRow(title: "Microphone", detail: "Hears your voice.", symbol: "mic.fill",
-                              granted: settings.microphone, action: settings.requestMicrophone)
-                PermissionRow(title: "Input Monitoring", detail: "Notices the Option key.", symbol: "keyboard.fill",
-                              granted: settings.inputMonitoring, action: settings.requestInputMonitoring)
-                PermissionRow(title: "Accessibility", detail: "Types the text where your cursor is.", symbol: "accessibility.fill",
-                              granted: settings.accessibility, action: settings.requestAccessibility)
-            }
-
-            Section("Dictation") {
-                Picker("Language", selection: $settings.language) {
-                    ForEach(AppSettings.languages, id: \.name) { Text($0.name).tag($0.code ?? "auto") }
-                }
+            Form {
+                LabeledContent("Microphone") { permission("Hears your voice.", granted: settings.microphone, action: settings.requestMicrophone) }
+                LabeledContent("Input Monitoring") { permission("Notices the Option key.", granted: settings.inputMonitoring, action: settings.requestInputMonitoring) }
+                LabeledContent("Accessibility") { permission("Types the text where your cursor is.", granted: settings.accessibility, action: settings.requestAccessibility) }
                 Toggle("Play sounds", isOn: $settings.sounds)
                 Toggle("Open at login", isOn: Binding(get: { settings.launchAtLogin }, set: settings.setLaunchAtLogin))
+                LabeledContent("Parakeet") { modelState }
+                LabeledContent("File transcription") { fileModelState }
             }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
 
-            Section("Model") {
-                LabeledContent("Granite Speech 4.1 · 2B") {
-                    if let err = settings.modelError {
-                        Label(err, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).lineLimit(2)
-                    } else if settings.modelReady {
-                        Label("Ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                    } else {
-                        HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Loading…") }.foregroundStyle(.secondary)
-                    }
-                }
+            Button("Transcribe a File…") {
+                NotificationCenter.default.post(name: .showFileTranscript, object: nil)
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+            .controlSize(.large)
+            .frame(maxWidth: .infinity)
+        }
+        .frame(minWidth: 440, minHeight: 560)
+    }
+
+    private func permission(_ detail: String, granted: Bool, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            if granted {
+                Text("Allowed").foregroundStyle(.secondary)
+            } else {
+                Button("Allow…", action: action).controlSize(.small)
             }
         }
-        .formStyle(.grouped)
-        .frame(width: 440)
-        .fixedSize(horizontal: false, vertical: true)
     }
-}
 
-private struct PermissionRow: View {
-    let title: String
-    let detail: String
-    let symbol: String
-    let granted: Bool
-    let action: () -> Void
+    @ViewBuilder private var modelState: some View {
+        if let err = settings.modelError {
+            Text(err).foregroundStyle(.orange).lineLimit(2)
+        } else if settings.modelReady {
+            Text("Ready").foregroundStyle(.secondary)
+        } else {
+            ProgressView().controlSize(.small)
+        }
+    }
 
-    var body: some View {
-        LabeledContent {
-            if granted {
-                Label("Allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-            } else {
-                Button("Allow…", action: action).buttonStyle(.glass)
-            }
-        } label: {
-            Label {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title)
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
-                }
-            } icon: { Image(systemName: symbol) }
+    @ViewBuilder private var fileModelState: some View {
+        if files.installed {
+            Text("Ready").foregroundStyle(.secondary)
+        } else if files.canRun {
+            Text("Not downloaded").foregroundStyle(.secondary)
+        } else {
+            Text("Needs 8 GB").foregroundStyle(.secondary)
         }
     }
 }

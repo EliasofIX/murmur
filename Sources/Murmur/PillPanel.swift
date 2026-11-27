@@ -1,24 +1,38 @@
 import AppKit
+import ObjectiveC
 import SwiftUI
 
-/// A tight, borderless, click-through panel whose content view *is* the system `NSGlassEffectView`,
-/// so the glass honours the user's Liquid Glass clarity setting. Size/fade animations run on the window.
+/// Click-through status panel whose content view is the system `NSGlassEffectView` in the clear style.
+///
+/// Clear Liquid Glass draws its rim only while the window is key. An inactive window falls back
+/// to the full-face frost, which ignores how far the Appearance slider is toward clear. The pill
+/// becomes key while it is on screen and resigns when it hides. It never activates Murmur, so
+/// the app the user is dictating into stays frontmost. Clicks pass through.
 @MainActor
 final class PillPanel: NSPanel {
     static let pillHeight: CGFloat = 52
 
     let model = PillModel()
-    private let glass = NSGlassEffectView()
+    /// Real `NSGlassEffectView` loaded by name. The Command Line Tools SDK does not export the class.
+    private let glass: NSView
     private var hideWork: DispatchWorkItem?
     private var centre = CGPoint.zero      // pill centre-x / bottom-y in screen coordinates
     private var shown = false
+    /// `orderOut` makes the next glass surface in this process resolve as frost, so the panel
+    /// is ordered in once and later hidden with alpha.
+    private var ordered = false
 
     init() {
+        let glassClass = NSClassFromString("NSGlassEffectView") as! NSView.Type
+        let view = glassClass.init(frame: .zero)
+        view.setValue(1, forKey: "style") // .clear — follows the system clearness slider
+        view.setValue(Self.pillHeight / 2, forKey: "cornerRadius")
+        glass = view
         super.init(
-            contentRect: CGRect(x: 0, y: 0, width: 132, height: Self.pillHeight),
-            styleMask: [.borderless, .nonactivatingPanel],
+            contentRect: CGRect(x: 0, y: 0, width: 148, height: Self.pillHeight),
+            styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
             backing: .buffered,
-            defer: true)
+            defer: false)
         isFloatingPanel = true
         level = .statusBar
         backgroundColor = .clear
@@ -26,46 +40,32 @@ final class PillPanel: NSPanel {
         hasShadow = false
         ignoresMouseEvents = true
         hidesOnDeactivate = false
+        isMovable = false
+        isRestorable = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        titlebarAppearsTransparent = true
+        titleVisibility = .hidden
+        titlebarSeparatorStyle = .none
+        setTitlebarHeight(0)
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            standardWindowButton(kind)?.isHidden = true
+        }
 
-        glass.style = .regular
-        glass.cornerRadius = Self.pillHeight / 2
         let host = NSHostingView(rootView: PillContentView(model: model))
         host.sizingOptions = []
-        glass.contentView = host
-        contentView = glass
+        view.setValue(host, forKey: "contentView")
+        contentView = view
     }
 
-    /// A borderless panel resolves Liquid Glass as a full-face frost with the lens drawn on top of it.
-    /// The backdrop filter is the same one system glass uses; zeroing its blur slab leaves the rim.
-    private func clearFrost() {
-        let rim = glass.cornerRadius
-        func walkLayer(_ layer: CALayer) {
-            for filter in layer.filters ?? [] {
-                let obj = filter as AnyObject
-                guard obj.value(forKey: "inputBlurRadius") != nil else { continue }
-                obj.setValue(0, forKey: "inputBlurRadius")
-                obj.setValue(0, forKey: "inputBlurOpacity0")
-                obj.setValue(0, forKey: "inputBlurOpacity1")
-                obj.setValue(0, forKey: "inputBlurOpacity2")
-                obj.setValue(0, forKey: "inputBlurOpacity3")
-                obj.setValue(0, forKey: "inputBlurFillBlurRadius")
-                obj.setValue(0, forKey: "inputBlurFillDarkenOpacity")
-                obj.setValue(-rim, forKey: "inputBlurDistance0")
-                obj.setValue(rim / 4, forKey: "inputOuterRefractionHeight")
-            }
-            layer.sublayers?.forEach(walkLayer)
-        }
-        func walkView(_ view: NSView) {
-            if let layer = view.layer { walkLayer(layer) }
-            view.subviews.forEach(walkView)
-        }
-        if let contentView { walkView(contentView) }
+    /// Private AppKit entry. The zero titlebar is what lets clear glass draw the rim shader.
+    private func setTitlebarHeight(_ height: CGFloat) {
+        let sel = NSSelectorFromString("setTitlebarHeight:")
+        guard let method = class_getInstanceMethod(type(of: self), sel) else { return }
+        typealias Fn = @convention(c) (AnyObject, Selector, CGFloat) -> Void
+        unsafeBitCast(method_getImplementation(method), to: Fn.self)(self, sel, height)
     }
 
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
 
     // MARK: - Presentation
 
@@ -78,13 +78,16 @@ final class PillPanel: NSPanel {
         if !wasShown {
             shown = true
             model.visible = true
-            setFrame(scaled(target, by: 0.55), display: false)
-            alphaValue = 0
-            orderFrontRegardless()
-            // The filter does not exist until the panel is on screen, and the pop-in rebuilds it.
-            DispatchQueue.main.async { [weak self] in self?.clearFrost() }
+            if !ordered {
+                setFrame(target, display: false)
+                alphaValue = 0
+                orderFrontRegardless()
+                ordered = true
+            }
         }
-        animate(to: target, alpha: 1, duration: wasShown ? 0.35 : 0.42)
+        // Active glass, without becoming the frontmost app.
+        makeKey()
+        animate(to: target, alpha: 1, duration: wasShown ? 0.35 : 0.28)
     }
 
     func update(_ phase: PillPhase) {
@@ -98,9 +101,9 @@ final class PillPanel: NSPanel {
             guard let self, self.shown else { return }
             self.shown = false
             self.model.visible = false
-            self.animate(to: self.scaled(self.frame, by: 0.7), alpha: 0, duration: 0.28) { [weak self] in
+            self.animate(to: self.frame, alpha: 0, duration: 0.22) { [weak self] in
                 guard let self, !self.shown else { return }
-                self.orderOut(nil)
+                self.resignKey()
             }
         }
         hideWork = work
@@ -118,7 +121,9 @@ final class PillPanel: NSPanel {
 
     private func width(for phase: PillPhase) -> CGFloat {
         switch phase {
-        case .listening, .processing:
+        case .listening:
+            return 156          // time in the middle, bars mirrored on either side
+        case .processing:
             return 148
         case .done:
             return Self.pillHeight
@@ -134,23 +139,14 @@ final class PillPanel: NSPanel {
         return CGRect(x: centre.x - w / 2, y: centre.y, width: w, height: Self.pillHeight)
     }
 
-    private func scaled(_ r: CGRect, by f: CGFloat) -> CGRect {
-        let w = r.width * f, h = r.height * f
-        return CGRect(x: r.midX - w / 2, y: r.midY - h / 2, width: w, height: h)
-    }
-
     private func animate(to frame: CGRect, alpha: CGFloat, duration: TimeInterval, completion: (@MainActor () -> Void)? = nil) {
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = duration
             ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
             self.animator().setFrame(frame, display: true)
             self.animator().alphaValue = alpha
-        } completionHandler: { [weak self] in
-            MainActor.assumeIsolated {
-                self?.clearFrost()
-                completion?()
-                DispatchQueue.main.async { self?.clearFrost() }
-            }
+        } completionHandler: {
+            MainActor.assumeIsolated { completion?() }
         }
     }
 }

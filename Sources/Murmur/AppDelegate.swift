@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = AppSettings.shared
     private let transcriber = Transcriber()
     private let hotkey = HotkeyMonitor()
@@ -10,7 +10,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: DictationController!
     private var statusItem: NSStatusItem!
     private var statusLine: NSMenuItem!
+    private var retryItem: NSMenuItem!
     private var settingsWindow: NSWindow?
+    private var fileWindow: NSWindow?
+    private var fileCloseHook: FileWindowClose?
+    private var fileTranscriptObserver: NSObjectProtocol?
     private var permissionTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -20,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         buildMenu()
         loadModel()
+        controller.showSavedTakeNotice()
         if ProcessInfo.processInfo.environment["MURMUR_PREVIEW"] != nil { startPreview(); return }
 
         // Permissions can be granted at any time; keep trying until the key tap works.
@@ -27,6 +32,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { self?.tick() }
         }
         tick()
+
+        fileTranscriptObserver = NotificationCenter.default.addObserver(
+            forName: .showFileTranscript, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.showFileTranscript() }
+        }
 
         if !settings.allPermissionsGranted || UserDefaults.standard.bool(forKey: "welcomed") == false {
             UserDefaults.standard.set(true, forKey: "welcomed")
@@ -68,13 +79,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLine.isEnabled = false
         menu.addItem(statusLine)
         menu.addItem(.separator())
+        retryItem = NSMenuItem(title: "Retry Last Transcription", action: #selector(retryLast), keyEquivalent: "")
+        retryItem.target = self
+        menu.addItem(retryItem)
+        menu.addItem(.separator())
         let prefs = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         prefs.target = self
         menu.addItem(prefs)
+        let files = NSMenuItem(title: "Transcribe a File…", action: #selector(openFileTranscript), keyEquivalent: "")
+        files.target = self
+        menu.addItem(files)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Murmur", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.delegate = self
         statusItem.menu = menu
     }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        retryItem.isEnabled = settings.modelReady && controller.canRetryLast
+    }
+
+    @objc private func retryLast() { controller.retryLast() }
 
     private func updateStatus() {
         if let err = settings.modelError { statusLine.title = err }
@@ -92,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startPreview() {
         let meter = LevelMeter()
         panel.model.meter = meter
+        panel.model.recordingStarted = Date()
         panel.present(.listening)
         Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { _ in
             let t = ProcessInfo.processInfo.systemUptime
@@ -104,16 +130,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showSettings() {
         if settingsWindow == nil {
-            let host = NSHostingController(rootView: SettingsView())
-            let window = NSWindow(contentViewController: host)
-            window.title = "Murmur"
-            window.styleMask = [.titled, .closable, .fullSizeContentView]
-            window.titlebarAppearsTransparent = true
-            window.isReleasedWhenClosed = false
-            window.center()
-            settingsWindow = window
+            settingsWindow = GlassWindow.make(
+                title: "Murmur",
+                size: NSSize(width: 480, height: 640),
+                resizable: true,
+                root: SettingsView())
         }
         NSApp.activate()
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
+
+    @objc private func openFileTranscript() { showFileTranscript() }
+
+    private func showFileTranscript() {
+        if fileWindow == nil {
+            let hook = FileWindowClose { FileTranscriptModel.shared.shutdown() }
+            fileCloseHook = hook
+            let window = GlassWindow.make(
+                title: "Transcribe a File",
+                size: NSSize(width: 520, height: 640),
+                resizable: true,
+                root: FileTranscriptView())
+            window.delegate = hook
+            fileWindow = window
+        }
+        FileTranscriptModel.shared.refreshInstallState()
+        NSApp.activate()
+        fileWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        FileTranscriptModel.shared.shutdown()
+    }
+}
+
+/// Keeps the file window's delegate alive and unloads the large model when the window closes.
+final class FileWindowClose: NSObject, NSWindowDelegate {
+    let onClose: () -> Void
+    init(onClose: @escaping () -> Void) { self.onClose = onClose }
+    func windowWillClose(_ notification: Notification) { onClose() }
 }
